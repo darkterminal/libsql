@@ -388,9 +388,16 @@ impl LogFile {
         };
         new_log_file.header = new_header;
         new_log_file.write_header().unwrap();
-        // swap old and new snapshot
-        // FIXME(marin): the dest path never changes, store it somewhere.
-        atomic_rename(&to_compact_log_path, path.join("wallog")).unwrap();
+        
+        // Create the wallog directory if it doesn't exist
+        let wallog_dir = path.join("wallog");
+        std::fs::create_dir_all(&wallog_dir)?; // <-- Ensure directory exists
+        
+        // Construct the destination path with the UUID filename inside wallog
+        let dest_path = wallog_dir.join(to_compact_id.to_string()); // <-- Include filename
+        
+        // Swap old and new snapshot with corrected destination path
+        atomic_rename(&to_compact_log_path, &dest_path).unwrap(); // <-- Use dest_path
         let old_log_file = std::mem::replace(self, new_log_file);
         compactor.compact(old_log_file, to_compact_log_path)?;
 
