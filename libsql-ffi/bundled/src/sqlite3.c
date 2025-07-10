@@ -67613,6 +67613,15 @@ static int walCheckpoint(
       }
     }
 
+
+#ifdef LIBSQL_CHECKPOINT_ONLY_FULL
+    // in case of LIBSQL_CHECKPOINT_ONLY_FULL option we want to either checkpoint whole WAL or quickly abort the checkpoint
+    if( mxSafeFrame!=walIndexHdr(pWal)->mxFrame ){
+        rc = SQLITE_BUSY;
+        goto walcheckpoint_out;
+    }
+#endif
+
     /* Allocate the iterator */
     if( pInfo->nBackfill<mxSafeFrame ){
       rc = walIteratorRevInit(pWal, pInfo->nBackfill, &pIter, mxSafeFrame, xCb == NULL);

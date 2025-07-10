@@ -1,11 +1,11 @@
 use crate::{local::Connection, util::ConnectorService, Error, Result};
 
-use std::path::Path;
-
+use crate::database::EncryptionContext;
 use bytes::Bytes;
 use chrono::Utc;
 use http::{HeaderValue, StatusCode};
 use hyper::Body;
+use std::path::Path;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 
@@ -20,6 +20,7 @@ const METADATA_VERSION: u32 = 0;
 
 const DEFAULT_MAX_RETRIES: usize = 5;
 const DEFAULT_PUSH_BATCH_SIZE: u32 = 128;
+const DEFAULT_PULL_BATCH_SIZE: u32 = 128;
 
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
@@ -60,6 +61,14 @@ pub enum SyncError {
     RedirectHeader(http::header::ToStrError),
     #[error("redirect response with no location header")]
     NoRedirectLocationHeader,
+    #[error("failed to pull db export: status={0}, error={1}")]
+    PullDb(StatusCode, String),
+    #[error("server returned a lower generation than local: local={0}, remote={1}")]
+    InvalidLocalGeneration(u32, u32),
+    #[error("invalid local state: {0}")]
+    InvalidLocalState(String),
+    #[error("server returned invalid length of frames: {0}")]
+    InvalidPullFrameBytes(usize),
 }
 
 impl SyncError {
@@ -72,6 +81,18 @@ pub struct PushResult {
     status: PushStatus,
     generation: u32,
     max_frame_no: u32,
+    baton: Option<String>,
+}
+
+pub struct DropAbort(pub Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for DropAbort {
+    fn drop(&mut self) {
+        tracing::debug!("aborting");
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 pub enum PushStatus {
@@ -80,10 +101,21 @@ pub enum PushStatus {
 }
 
 pub enum PullResult {
-    /// A frame was successfully pulled.
-    Frame(Bytes),
+    /// Frames were successfully pulled.
+    Frames(Bytes),
     /// We've reached the end of the generation.
     EndOfGeneration { max_generation: u32 },
+}
+
+#[derive(serde::Deserialize)]
+struct InfoResult {
+    current_generation: u32,
+}
+
+#[derive(Debug)]
+struct PushFramesResult {
+    max_frame_no: u32,
+    baton: Option<String>,
 }
 
 pub struct SyncContext {
@@ -93,10 +125,16 @@ pub struct SyncContext {
     auth_token: Option<HeaderValue>,
     max_retries: usize,
     push_batch_size: u32,
+    pull_batch_size: u32,
     /// The current durable generation.
     durable_generation: u32,
     /// Represents the max_frame_no from the server.
     durable_frame_num: u32,
+    /// whenever sync is called very first time, we will call the remote server
+    /// to get the generation information and sync the db file if needed
+    initial_server_sync: bool,
+    /// The encryption context for the sync.
+    remote_encryption: Option<EncryptionContext>,
 }
 
 impl SyncContext {
@@ -105,6 +143,7 @@ impl SyncContext {
         db_path: String,
         sync_url: String,
         auth_token: Option<String>,
+        remote_encryption: Option<EncryptionContext>,
     ) -> Result<Self> {
         let client = hyper::client::Client::builder().build::<_, hyper::Body>(connector);
 
@@ -122,9 +161,12 @@ impl SyncContext {
             auth_token,
             max_retries: DEFAULT_MAX_RETRIES,
             push_batch_size: DEFAULT_PUSH_BATCH_SIZE,
+            pull_batch_size: DEFAULT_PULL_BATCH_SIZE,
             client,
-            durable_generation: 1,
+            durable_generation: 0,
             durable_frame_num: 0,
+            initial_server_sync: false,
+            remote_encryption,
         };
 
         if let Err(e) = me.read_metadata().await {
@@ -142,7 +184,7 @@ impl SyncContext {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn pull_one_frame(
+    pub(crate) async fn pull_frames(
         &mut self,
         generation: u32,
         frame_no: u32,
@@ -152,9 +194,10 @@ impl SyncContext {
             self.sync_url,
             generation,
             frame_no,
-            frame_no + 1
+            // the server expects the range of [start, end) frames, i.e. end is exclusive
+            frame_no + self.pull_batch_size
         );
-        tracing::debug!("pulling frame");
+        tracing::debug!("pulling frame (uri={})", uri);
         self.pull_with_retry(uri, self.max_retries).await
     }
 
@@ -165,26 +208,44 @@ impl SyncContext {
         generation: u32,
         frame_no: u32,
         frames_count: u32,
-    ) -> Result<u32> {
-        let uri = format!(
-            "{}/sync/{}/{}/{}",
-            self.sync_url,
-            generation,
+        baton: Option<String>,
+    ) -> Result<PushFramesResult> {
+        let uri = {
+            let mut uri = format!(
+                "{}/sync/{}/{}/{}",
+                self.sync_url,
+                generation,
+                frame_no,
+                frame_no + frames_count
+            );
+            if let Some(ref baton) = baton {
+                uri.push_str(&format!("/{}", baton));
+            }
+            uri
+        };
+
+        tracing::debug!(
+            "pushing frame(frame_no={} (to={}), count={}, generation={}, baton={:?})",
             frame_no,
-            frame_no + frames_count
+            frame_no + frames_count,
+            frames_count,
+            generation,
+            baton
         );
-        tracing::debug!("pushing frame");
 
         let result = self.push_with_retry(uri, frames, self.max_retries).await?;
 
         match result.status {
             PushStatus::Conflict => {
-                return Err(SyncError::InvalidPushFrameConflict(frame_no, result.max_frame_no).into());
+                return Err(
+                    SyncError::InvalidPushFrameConflict(frame_no, result.max_frame_no).into(),
+                );
             }
             _ => {}
         }
         let generation = result.generation;
         let durable_frame_num = result.max_frame_no;
+        let baton = result.baton;
 
         if durable_frame_num > frame_no + frames_count - 1 {
             tracing::error!(
@@ -213,14 +274,26 @@ impl SyncContext {
         tracing::debug!(?durable_frame_num, "frame successfully pushed");
 
         // Update our last known max_frame_no from the server.
-        tracing::debug!(?generation, ?durable_frame_num, "updating remote generation and durable_frame_num");
+        tracing::debug!(
+            ?generation,
+            ?durable_frame_num,
+            "updating remote generation and durable_frame_num"
+        );
         self.durable_generation = generation;
         self.durable_frame_num = durable_frame_num;
 
-        Ok(durable_frame_num)
+        Ok(PushFramesResult {
+            max_frame_no: durable_frame_num,
+            baton,
+        })
     }
 
-    async fn push_with_retry(&self, mut uri: String, body: Bytes, max_retries: usize) -> Result<PushResult> {
+    async fn push_with_retry(
+        &self,
+        mut uri: String,
+        body: Bytes,
+        max_retries: usize,
+    ) -> Result<PushResult> {
         let mut nr_retries = 0;
         loop {
             let mut req = http::Request::post(uri.clone());
@@ -232,6 +305,10 @@ impl SyncContext {
                         .insert("Authorization", auth_token.clone());
                 }
                 None => {}
+            }
+
+            if let Some(remote_encryption) = &self.remote_encryption {
+                req = req.header("x-turso-encryption-key", remote_encryption.key.as_string());
             }
 
             let req = req.body(body.clone().into()).expect("valid body");
@@ -274,14 +351,32 @@ impl SyncContext {
                     .as_u64()
                     .ok_or_else(|| SyncError::JsonValue(max_frame_no.clone()))?;
 
+                let baton = resp
+                    .get("baton")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                tracing::trace!(
+                    ?baton,
+                    ?generation,
+                    ?max_frame_no,
+                    ?status,
+                    "pushed frame to server"
+                );
+
                 let status = match status {
                     "ok" => PushStatus::Ok,
                     "conflict" => PushStatus::Conflict,
                     _ => return Err(SyncError::JsonValue(resp.clone()).into()),
                 };
-                let generation = generation as u32; 
+                let generation = generation as u32;
                 let max_frame_no = max_frame_no as u32;
-                return Ok(PushResult { status, generation, max_frame_no });
+                return Ok(PushResult {
+                    status,
+                    generation,
+                    max_frame_no,
+                    baton,
+                });
             }
 
             if res.status().is_redirection() {
@@ -327,6 +422,10 @@ impl SyncContext {
                 None => {}
             }
 
+            if let Some(remote_encryption) = &self.remote_encryption {
+                req = req.header("x-turso-encryption-key", remote_encryption.key.as_string());
+            }
+
             let req = req.body(Body::empty()).expect("valid request");
 
             let res = self
@@ -336,18 +435,39 @@ impl SyncContext {
                 .map_err(SyncError::HttpDispatch)?;
 
             if res.status().is_success() {
-                let frame = hyper::body::to_bytes(res.into_body())
+                let frames = hyper::body::to_bytes(res.into_body())
                     .await
                     .map_err(SyncError::HttpBody)?;
-                return Ok(PullResult::Frame(frame));
+                // a success result should always return some frames
+                if frames.is_empty() {
+                    tracing::error!("server returned empty frames in pull response");
+                    return Err(SyncError::InvalidPullFrameBytes(0).into());
+                }
+                // the minimum payload size cannot be less than a single frame
+                if frames.len() < FRAME_SIZE {
+                    tracing::error!(
+                        "server returned frames with invalid length: {} < {}",
+                        frames.len(),
+                        FRAME_SIZE
+                    );
+                    return Err(SyncError::InvalidPullFrameBytes(frames.len()).into());
+                }
+                return Ok(PullResult::Frames(frames));
             }
             // BUG ALERT: The server returns a 500 error if the remote database is empty.
             // This is a bug and should be fixed.
-            if res.status() == StatusCode::BAD_REQUEST || res.status() == StatusCode::INTERNAL_SERVER_ERROR {
+            if res.status() == StatusCode::BAD_REQUEST
+                || res.status() == StatusCode::INTERNAL_SERVER_ERROR
+            {
+                let status = res.status();
                 let res_body = hyper::body::to_bytes(res.into_body())
                     .await
                     .map_err(SyncError::HttpBody)?;
-
+                tracing::trace!(
+                    "server returned: {} body: {}",
+                    status,
+                    String::from_utf8_lossy(&res_body[..])
+                );
                 let resp = serde_json::from_slice::<serde_json::Value>(&res_body[..])
                     .map_err(SyncError::JsonDecode)?;
 
@@ -358,7 +478,9 @@ impl SyncContext {
                 let generation = generation
                     .as_u64()
                     .ok_or_else(|| SyncError::JsonValue(generation.clone()))?;
-                return Ok(PullResult::EndOfGeneration { max_generation: generation as u32 });
+                return Ok(PullResult::EndOfGeneration {
+                    max_generation: generation as u32,
+                });
             }
             if res.status().is_redirection() {
                 uri = match res.headers().get(hyper::header::LOCATION) {
@@ -389,7 +511,6 @@ impl SyncContext {
             nr_retries += 1;
         }
     }
-
 
     pub(crate) fn next_generation(&mut self) {
         self.durable_generation += 1;
@@ -456,6 +577,161 @@ impl SyncContext {
         self.durable_generation = metadata.generation;
         self.durable_frame_num = metadata.durable_frame_num;
 
+        Ok(())
+    }
+
+    /// get_remote_info calls the remote server to get the current generation information.
+    async fn get_remote_info(&self) -> Result<InfoResult> {
+        let uri = format!("{}/info", self.sync_url);
+        let mut req = http::Request::builder().method("GET").uri(&uri);
+
+        if let Some(auth_token) = &self.auth_token {
+            req = req.header("Authorization", auth_token);
+        }
+
+        if let Some(remote_encryption) = &self.remote_encryption {
+            req = req.header("x-turso-encryption-key", remote_encryption.key.as_string());
+        }
+
+        let req = req.body(Body::empty()).expect("valid request");
+
+        let res = self
+            .client
+            .request(req)
+            .await
+            .map_err(SyncError::HttpDispatch)?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = hyper::body::to_bytes(res.into_body())
+                .await
+                .map_err(SyncError::HttpBody)?;
+            return Err(
+                SyncError::PullDb(status, String::from_utf8_lossy(&body).to_string()).into(),
+            );
+        }
+
+        let body = hyper::body::to_bytes(res.into_body())
+            .await
+            .map_err(SyncError::HttpBody)?;
+
+        let info = serde_json::from_slice(&body).map_err(SyncError::JsonDecode)?;
+
+        Ok(info)
+    }
+
+    async fn sync_db_if_needed(&mut self, generation: u32) -> Result<()> {
+        // somehow we are ahead of the remote in generations. following should not happen because
+        // we checkpoint only if the remote server tells us to do so.
+        if self.durable_generation > generation {
+            tracing::error!(
+                "server returned a lower generation than what we have: local={}, remote={}",
+                self.durable_generation,
+                generation
+            );
+            return Err(
+                SyncError::InvalidLocalGeneration(self.durable_generation, generation).into(),
+            );
+        }
+        // we use the following heuristic to determine if we need to sync the db file
+        // 1. if no db file or the metadata file exists, then user is starting from scratch
+        //    and we will do the sync
+        // 2. if the db file exists, but the metadata file does not exist (or other way around),
+        //    then local db is in an incorrect state. we stop and return with an error
+        // 3. if the db file exists and the metadata file exists, then we don't need to do the
+        //    sync
+        let metadata_exists = check_if_file_exists(&format!("{}-info", self.db_path))?;
+        let db_file_exists = check_if_file_exists(&self.db_path)?;
+        match (metadata_exists, db_file_exists) {
+            (false, false) => {
+                // neither the db file nor the metadata file exists, lets bootstrap from remote
+                tracing::debug!(
+                    "syncing db file from remote server, generation={}",
+                    generation
+                );
+                self.sync_db(generation).await
+            }
+            (false, true) => {
+                // kinda inconsistent state: DB exists but metadata missing
+                // however, this generally not an issue. For a fresh db, a user might do writes
+                // locally and then try to do sync later. So in this case, we will not
+                // bootstrap the db file and let the user proceed. If it is not a fresh db, the
+                // push will fail anyways later.
+                // if metadata file does not exist, then generation should be zero
+                assert_eq!(self.durable_generation, 0);
+                // lets initialise it to first generation
+                self.durable_generation = 1;
+                Ok(())
+            }
+            (true, false) => {
+                // inconsistent state: Metadata exists but DB missing
+                tracing::error!(
+                    "local state is incorrect, metadata file exists but db file does not"
+                );
+                Err(SyncError::InvalidLocalState(
+                    "metadata file exists but db file does not".to_string(),
+                )
+                .into())
+            }
+            (true, true) => {
+                // both files exists, no need to sync
+                Ok(())
+            }
+        }
+    }
+
+    /// sync_db will download the db file from the remote server and replace the local file.
+    async fn sync_db(&mut self, generation: u32) -> Result<()> {
+        let uri = format!("{}/export/{}", self.sync_url, generation);
+        let mut req = http::Request::builder().method("GET").uri(&uri);
+
+        if let Some(auth_token) = &self.auth_token {
+            req = req.header("Authorization", auth_token);
+        }
+
+        if let Some(remote_encryption) = &self.remote_encryption {
+            req = req.header("x-turso-encryption-key", remote_encryption.key.as_string());
+        }
+
+        let req = req.body(Body::empty()).expect("valid request");
+
+        let (res, http_duration) =
+            crate::replication::remote_client::time(self.client.request(req)).await;
+        let res = res.map_err(SyncError::HttpDispatch)?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = hyper::body::to_bytes(res.into_body())
+                .await
+                .map_err(SyncError::HttpBody)?;
+            tracing::error!(
+                "failed to pull db file from remote server, status={}, body={}, url={}, duration={:?}",
+                status,
+                String::from_utf8_lossy(&body),
+                uri,
+                http_duration
+            );
+            return Err(
+                SyncError::PullFrame(status, String::from_utf8_lossy(&body).to_string()).into(),
+            );
+        }
+
+        tracing::debug!(
+            "pulled db file from remote server, status={}, url={}, duration={:?}",
+            res.status(),
+            uri,
+            http_duration
+        );
+
+        // todo: do streaming write to the disk
+        let bytes = hyper::body::to_bytes(res.into_body())
+            .await
+            .map_err(SyncError::HttpBody)?;
+
+        atomic_write(&self.db_path, &bytes).await?;
+        self.durable_generation = generation;
+        self.durable_frame_num = 0;
+        self.write_metadata().await?;
         Ok(())
     }
 }
@@ -534,6 +810,28 @@ async fn atomic_write<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// bootstrap_db brings the .db file from remote, if required. If the .db file already exists, then
+/// it does nothing. Calling this function multiple times is safe.
+/// However, make sure there are no existing active connections to the db file as this method can
+/// replace it
+pub async fn bootstrap_db(sync_ctx: &mut SyncContext) -> Result<()> {
+    // todo: we are checking with the remote server only during initialisation. ideally,
+    // we need to do this when we notice a large gap in generations, when bootstrapping is cheaper
+    // than pulling each frame
+    if !sync_ctx.initial_server_sync {
+        // sync is being called first time. so we will call remote, get the generation information
+        // if we are lagging behind, then we will call the export API and get to the latest
+        // generation directly.
+        let info = sync_ctx.get_remote_info().await?;
+        sync_ctx.sync_db_if_needed(info.current_generation).await?;
+        // when sync_ctx is initialised, we set durable_generation to 0. however, once
+        // sync_db is called, it should be > 0.
+        assert!(sync_ctx.durable_generation > 0, "generation should be > 0");
+        sync_ctx.initial_server_sync = true;
+    }
+    Ok(())
+}
+
 /// Sync WAL frames to remote.
 pub async fn sync_offline(
     sync_ctx: &mut SyncContext,
@@ -604,6 +902,7 @@ async fn try_push(
     let generation = sync_ctx.durable_generation();
     let start_frame_no = sync_ctx.durable_frame_num() + 1;
     let end_frame_no = max_frame_no;
+    let mut baton = None;
 
     let mut frame_no = start_frame_no;
     while frame_no <= end_frame_no {
@@ -620,9 +919,12 @@ async fn try_push(
         // The server returns its maximum frame number. To avoid resending
         // frames the server already knows about, we need to update the
         // frame number to the one returned by the server.
-        let max_frame_no = sync_ctx
-            .push_frames(frames.freeze(), generation, frame_no, batch_size)
+        let result = sync_ctx
+            .push_frames(frames.freeze(), generation, frame_no, batch_size, baton)
             .await?;
+        // if the server sent us a baton, then we will reuse it for the next request
+        baton = result.baton;
+        let max_frame_no = result.max_frame_no;
 
         if max_frame_no > frame_no {
             frame_no = max_frame_no + 1;
@@ -642,21 +944,48 @@ async fn try_push(
     })
 }
 
-async fn try_pull(
+/// PAGE_SIZE used by the sync / diskless server
+const PAGE_SIZE: usize = 4096;
+const FRAME_HEADER_SIZE: usize = 24;
+const FRAME_SIZE: usize = PAGE_SIZE + FRAME_HEADER_SIZE;
+
+pub async fn try_pull(
     sync_ctx: &mut SyncContext,
     conn: &Connection,
 ) -> Result<crate::database::Replicated> {
     let insert_handle = conn.wal_insert_handle()?;
 
     let mut err = None;
-    
+
     loop {
         let generation = sync_ctx.durable_generation();
         let frame_no = sync_ctx.durable_frame_num() + 1;
-        match sync_ctx.pull_one_frame(generation, frame_no).await {
-            Ok(PullResult::Frame(frame)) => {
-                insert_handle.insert(&frame)?;
-                sync_ctx.durable_frame_num = frame_no;
+        match sync_ctx.pull_frames(generation, frame_no).await {
+            Ok(PullResult::Frames(frames)) => {
+                tracing::debug!(
+                    "pull_frames: generation={}, start_frame={} (end_frame={}, batch_size={}), frames_size={}",
+                    generation, frame_no, frame_no +  sync_ctx.pull_batch_size,  sync_ctx.pull_batch_size, frames.len(),
+                );
+                if frames.len() % FRAME_SIZE != 0 {
+                    tracing::error!(
+                        "frame size {} is not a multiple of the expected size {}",
+                        frames.len(),
+                        FRAME_SIZE,
+                    );
+                    return Err(SyncError::InvalidPullFrameBytes(frames.len()).into());
+                }
+                for chunk in frames.chunks(FRAME_SIZE) {
+                    let r = insert_handle.insert(&chunk);
+                    if let Err(e) = r {
+                        tracing::error!(
+                            "insert error (frame= {}) : {:?}",
+                            sync_ctx.durable_frame_num + 1,
+                            e
+                        );
+                        return Err(e);
+                    }
+                    sync_ctx.durable_frame_num += 1;
+                }
             }
             Ok(PullResult::EndOfGeneration { max_generation }) => {
                 // If there are no more generations to pull, we're done.
@@ -675,7 +1004,7 @@ async fn try_pull(
                 insert_handle.begin()?;
             }
             Err(e) => {
-                tracing::debug!("pull_one_frame error: {:?}", e);
+                tracing::debug!("pull_frames error: {:?}", e);
                 err.replace(e);
                 break;
             }
@@ -702,4 +1031,10 @@ async fn try_pull(
             frames_synced: 1,
         })
     }
+}
+
+fn check_if_file_exists(path: &str) -> core::result::Result<bool, SyncError> {
+    Path::new(&path)
+        .try_exists()
+        .map_err(SyncError::io("metadata file exists"))
 }

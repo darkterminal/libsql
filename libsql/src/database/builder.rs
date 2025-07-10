@@ -2,9 +2,11 @@ cfg_core! {
     use crate::EncryptionConfig;
 }
 
+use super::DbType;
 use crate::{Database, Result};
 
-use super::DbType;
+#[cfg(any(feature = "remote", feature = "sync"))]
+pub use crate::database::EncryptionContext;
 
 /// A builder for [`Database`]. This struct can be used to build
 /// all variants of [`Database`]. These variants include:
@@ -60,15 +62,19 @@ impl Builder<()> {
                         auth_token,
                         connector: None,
                         version: None,
+                        namespace: None,
+                        #[cfg(any(feature = "remote", feature = "sync"))]
+                        remote_encryption: None,
                     },
                     encryption_config: None,
                     read_your_writes: true,
                     sync_interval: None,
                     http_request_callback: None,
-                    namespace: None,
                     skip_safety_assert: false,
                     #[cfg(feature = "sync")]
                     sync_protocol: Default::default(),
+                    #[cfg(feature = "sync")]
+                    remote_encryption: None
                 },
             }
         }
@@ -103,11 +109,15 @@ impl Builder<()> {
                         auth_token,
                         connector: None,
                         version: None,
+                        namespace: None,
+                        remote_encryption: None,
                     },
                     connector: None,
                     read_your_writes: true,
                     remote_writes: false,
                     push_batch_size: 0,
+                    sync_interval: None,
+                    remote_encryption: None,
                 },
             }
         }
@@ -122,6 +132,8 @@ impl Builder<()> {
                     auth_token,
                     connector: None,
                     version: None,
+                    namespace: None,
+                    remote_encryption: None,
                 },
             }
         }
@@ -135,6 +147,9 @@ cfg_replication_or_remote_or_sync! {
         auth_token: String,
         connector: Option<crate::util::ConnectorService>,
         version: Option<String>,
+        namespace: Option<String>,
+        #[cfg(any(feature = "remote", feature = "sync"))]
+        remote_encryption: Option<EncryptionContext>,
     }
 }
 
@@ -172,7 +187,7 @@ cfg_core! {
         /// Using this setting is very UNSAFE and you are expected to use the libsql in adherence
         /// with the sqlite3 threadsafe rules or else you WILL create undefined behavior. Use at
         /// your own risk.
-        pub unsafe fn skip_saftey_assert(mut self, skip: bool) -> Builder<Local> {
+        pub unsafe fn skip_safety_assert(mut self, skip: bool) -> Builder<Local> {
             self.inner.skip_safety_assert = skip;
             self
         }
@@ -203,7 +218,7 @@ cfg_core! {
                         path,
                         flags: self.inner.flags,
                         encryption_config: self.inner.encryption_config,
-                        skip_saftey_assert: self.inner.skip_safety_assert
+                        skip_safety_assert: self.inner.skip_safety_assert
                     },
                     max_write_replication_index: Default::default(),
                 }
@@ -223,10 +238,11 @@ cfg_replication! {
         read_your_writes: bool,
         sync_interval: Option<std::time::Duration>,
         http_request_callback: Option<crate::util::HttpRequestCallback>,
-        namespace: Option<String>,
         skip_safety_assert: bool,
         #[cfg(feature = "sync")]
         sync_protocol: super::SyncProtocol,
+        #[cfg(feature = "sync")]
+        remote_encryption: Option<EncryptionContext>,
     }
 
     /// Local replica configuration type in [`Builder`].
@@ -288,6 +304,13 @@ cfg_replication! {
             self
         }
 
+        /// Set the encryption context if the database is encrypted in remote server.
+        #[cfg(feature = "sync")]
+        pub fn remote_encryption(mut self, encryption_context: Option<EncryptionContext>) -> Builder<RemoteReplica> {
+            self.inner.remote_encryption = encryption_context;
+            self
+        }
+
         pub fn http_request_callback<F>(mut self, f: F) -> Builder<RemoteReplica>
         where
             F: Fn(&mut http::Request<()>) + Send + Sync + 'static
@@ -300,7 +323,7 @@ cfg_replication! {
         /// Set the namespace that will be communicated to remote replica in the http header.
         pub fn namespace(mut self, namespace: impl Into<String>) -> Builder<RemoteReplica>
         {
-            self.inner.namespace = Some(namespace.into());
+            self.inner.remote.namespace = Some(namespace.into());
             self
         }
 
@@ -319,7 +342,7 @@ cfg_replication! {
         /// Using this setting is very UNSAFE and you are expected to use the libsql in adherence
         /// with the sqlite3 threadsafe rules or else you WILL create undefined behavior. Use at
         /// your own risk.
-        pub unsafe fn skip_saftey_assert(mut self, skip: bool) -> Builder<RemoteReplica> {
+        pub unsafe fn skip_safety_assert(mut self, skip: bool) -> Builder<RemoteReplica> {
             self.inner.skip_safety_assert = skip;
             self
         }
@@ -334,15 +357,18 @@ cfg_replication! {
                         auth_token,
                         connector,
                         version,
+                        namespace,
+                        ..
                     },
                 encryption_config,
                 read_your_writes,
                 sync_interval,
                 http_request_callback,
-                namespace,
                 skip_safety_assert,
                 #[cfg(feature = "sync")]
                 sync_protocol,
+                #[cfg(feature = "sync")]
+                remote_encryption,
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
@@ -372,7 +398,7 @@ cfg_replication! {
                         } else {
                             url.to_string()
                         };
-                        let req = http::Request::get(format!("{prefix}/sync/0/0/0"))
+                        let req = http::Request::get(format!("{prefix}/info"))
                             .header("Authorization", format!("Bearer {}", auth_token))
                             .body(hyper::Body::empty())
                             .unwrap();
@@ -401,11 +427,19 @@ cfg_replication! {
 
                         if res.status().is_success() {
                             tracing::trace!("Using sync protocol v2 for {}", url);
-                            return Builder::new_synced_database(path, url, auth_token)
+                            let builder = Builder::new_synced_database(path, url, auth_token)
+                                .connector(connector)
                                 .remote_writes(true)
                                 .read_your_writes(read_your_writes)
-                                .build()
-                                .await;
+                                .remote_encryption(remote_encryption);
+
+                            let builder = if let Some(sync_interval) = sync_interval {
+                                builder.sync_interval(sync_interval)
+                            } else {
+                                builder
+                            };
+
+                            return builder.build().await;
                         }
                         tracing::trace!("Using sync protocol v1 for {} based on probe results", url);
                     }
@@ -454,7 +488,10 @@ cfg_replication! {
 
 
             Ok(Database {
-                db_type: DbType::Sync { db, encryption_config },
+                db_type: DbType::Sync {
+                    db,
+                    encryption_config,
+                },
                 max_write_replication_index: Default::default(),
             })
         }
@@ -493,6 +530,8 @@ cfg_replication! {
                 auth_token,
                 connector,
                 version,
+                namespace,
+                ..
             }) = remote
             {
                 let connector = if let Some(connector) = connector {
@@ -517,6 +556,7 @@ cfg_replication! {
                     flags,
                     encryption_config.clone(),
                     http_request_callback,
+                    namespace,
                 )
                 .await?
             } else {
@@ -541,6 +581,8 @@ cfg_sync! {
         remote_writes: bool,
         read_your_writes: bool,
         push_batch_size: u32,
+        sync_interval: Option<std::time::Duration>,
+        remote_encryption: Option<EncryptionContext>,
     }
 
     impl Builder<SyncedDatabase> {
@@ -565,6 +607,20 @@ cfg_sync! {
             self
         }
 
+        /// Set the duration at which the replicator will automatically call `sync` in the
+        /// background. The sync will continue for the duration that the resulted `Database`
+        /// type is alive for, once it is dropped the background task will get dropped and stop.
+        pub fn sync_interval(mut self, duration: std::time::Duration) -> Builder<SyncedDatabase> {
+            self.inner.sync_interval = Some(duration);
+            self
+        }
+
+         /// Set the encryption context if the database is encrypted in remote server.
+        pub fn remote_encryption(mut self, encryption_context: Option<EncryptionContext>) -> Builder<SyncedDatabase> {
+            self.inner.remote_encryption = encryption_context;
+            self
+        }
+
         /// Provide a custom http connector that will be used to create http connections.
         pub fn connector<C>(mut self, connector: C) -> Builder<SyncedDatabase>
         where
@@ -579,6 +635,8 @@ cfg_sync! {
 
         /// Build a connection to a local database that can be synced to remote server.
         pub async fn build(self) -> Result<Database> {
+            use tracing::Instrument as _;
+
             let SyncedDatabase {
                 path,
                 flags,
@@ -588,11 +646,15 @@ cfg_sync! {
                         auth_token,
                         connector: _,
                         version: _,
+                        namespace: _,
+                        ..
                     },
                 connector,
                 remote_writes,
                 read_your_writes,
                 push_batch_size,
+                sync_interval,
+                remote_encryption,
             } = self.inner;
 
             let path = path.to_str().ok_or(crate::Error::InvalidUTF8Path)?.to_owned();
@@ -616,11 +678,64 @@ cfg_sync! {
                 flags,
                 url.clone(),
                 auth_token.clone(),
+                remote_encryption.clone(),
             )
             .await?;
 
             if push_batch_size > 0 {
                 db.sync_ctx.as_ref().unwrap().lock().await.set_push_batch_size(push_batch_size);
+            }
+
+            let mut bg_abort: Option<std::sync::Arc<crate::sync::DropAbort>> = None;
+
+
+            if let Some(sync_interval) = sync_interval {
+                let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+                let sync_span = tracing::debug_span!("sync_interval");
+                let _enter = sync_span.enter();
+
+                let sync_ctx = db.sync_ctx.as_ref().unwrap().clone();
+                {
+                    let mut ctx = sync_ctx.lock().await;
+                    crate::sync::bootstrap_db(&mut ctx).await?;
+                    tracing::debug!("finished bootstrap with sync interval");
+                }
+
+                // db.connect creates a local db file, so it is important that we always call
+                // `bootstrap_db` (for synced dbs) before calling connect. Otherwise, the sync
+                // protocol skips calling `export` endpoint causing slowdown in initial bootstrap.
+                let conn = db.connect()?;
+
+                tokio::spawn(
+                    async move {
+                        let mut interval = tokio::time::interval(sync_interval);
+
+                        loop {
+                            tokio::select! {
+                                _ = &mut cancel_rx => break,
+                                _ = interval.tick() => {
+                                    tracing::debug!("trying to sync");
+
+                                    let mut ctx = sync_ctx.lock().await;
+
+                                    let result = if remote_writes {
+                                        crate::sync::try_pull(&mut ctx, &conn).await
+                                    } else {
+                                        crate::sync::sync_offline(&mut ctx, &conn).await
+                                    };
+
+                                    if let Err(e) = result {
+                                        tracing::error!("Error syncing database: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .instrument(tracing::debug_span!("sync interval thread")),
+                );
+
+                bg_abort.replace(std::sync::Arc::new(crate::sync::DropAbort(Some(cancel_tx))));
             }
 
             Ok(Database {
@@ -631,6 +746,9 @@ cfg_sync! {
                     url,
                     auth_token,
                     connector,
+                    _bg_abort: bg_abort,
+                    #[cfg(feature = "sync")]
+                    remote_encryption,
                 },
                 max_write_replication_index: Default::default(),
             })
@@ -658,6 +776,19 @@ cfg_remote! {
             self
         }
 
+        /// Set the namespace that will be communicated to the remote in the http header.
+        pub fn namespace(mut self, namespace: impl Into<String>) -> Builder<Remote>
+        {
+            self.inner.namespace = Some(namespace.into());
+            self
+        }
+
+        /// Set the encryption context if the database is encrypted in remote server.
+        pub fn remote_encryption(mut self, encryption_context: Option<EncryptionContext>) -> Builder<Remote> {
+            self.inner.remote_encryption = encryption_context;
+            self
+        }
+
         /// Build the remote database client.
         pub async fn build(self) -> Result<Database> {
             let Remote {
@@ -665,6 +796,8 @@ cfg_remote! {
                 auth_token,
                 connector,
                 version,
+                namespace,
+                remote_encryption,
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
@@ -686,6 +819,8 @@ cfg_remote! {
                     auth_token,
                     connector,
                     version,
+                    namespace,
+                    remote_encryption
                 },
                 max_write_replication_index: Default::default(),
             })

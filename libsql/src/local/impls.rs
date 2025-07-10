@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::connection::BatchRows;
 use crate::{
-    connection::Conn,
+    connection::{AuthHook, Conn},
     params::Params,
     rows::{ColumnsInner, RowInner, RowsInner},
     statement::Stmt,
@@ -88,6 +88,10 @@ impl Conn for LibsqlConnection {
     fn load_extension(&self, dylib_path: &Path, entry_point: Option<&str>) -> Result<()> {
         self.conn.load_extension(dylib_path, entry_point)
     }
+
+    fn authorizer(&self, hook: Option<AuthHook>) -> Result<()> {
+        self.conn.authorizer(hook)
+    }
 }
 
 impl Drop for LibsqlConnection {
@@ -139,6 +143,10 @@ impl Stmt for LibsqlStmt {
 
     fn parameter_name(&self, idx: i32) -> Option<&str> {
         self.0.parameter_name(idx)
+    }
+
+    fn column_count(&self) -> usize {
+        self.0.column_count()
     }
 
     fn columns(&self) -> Vec<Column> {

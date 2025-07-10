@@ -7,7 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Native bindings to libSQL"
 build = "build.rs"
-exclude = ["bundled/SQLite3MultipleCiphers/build", "bundled/SQLite3MultipleCiphers/test"]
+exclude = [
+  "bundled/SQLite3MultipleCiphers/build",
+  "bundled/SQLite3MultipleCiphers/test",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,6 +18,7 @@ exclude = ["bundled/SQLite3MultipleCiphers/build", "bundled/SQLite3MultipleCiphe
 libsql-wasmtime-bindings = { version = "0.2.1", optional = true }
 
 [build-dependencies]
+cmake = "0.1.54"
 bindgen = "0.66.1"
 cc = "1.0"
 glob = "0.3"
@@ -37,11 +41,12 @@ sqlean-extension-math = []
 sqlean-extension-stats = []
 sqlean-extension-text = []
 sqlean-extensions = [
-    "sqlean-extension-uuid",
-    "sqlean-extension-crypto",
-    "sqlean-extension-fuzzy",
-    "sqlean-extension-math",
-    "sqlean-extension-stats",
-    "sqlean-extension-text"
+  "sqlean-extension-uuid",
+  "sqlean-extension-crypto",
+  "sqlean-extension-fuzzy",
+  "sqlean-extension-math",
+  "sqlean-extension-stats",
+  "sqlean-extension-text",
 ]
 libsql-disable-checkpoint-downgrade = []
+libsql-checkpoint-only-full= []

@@ -26,17 +26,33 @@ pub type ByteStream = Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Syn
 pub struct HttpSender {
     inner: hyper::Client<ConnectorService, hyper::Body>,
     version: HeaderValue,
+    namespace: Option<HeaderValue>,
+    #[cfg(any(feature = "remote", feature = "sync"))]
+    remote_encryption: Option<crate::database::EncryptionContext>,
 }
 
 impl HttpSender {
-    pub fn new(connector: ConnectorService, version: Option<&str>) -> Self {
+    pub fn new(
+        connector: ConnectorService,
+        version: Option<&str>,
+        namespace: Option<&str>,
+        #[cfg(any(feature = "remote", feature = "sync"))] remote_encryption: Option<
+            crate::database::EncryptionContext,
+        >,
+    ) -> Self {
         let ver = version.unwrap_or(env!("CARGO_PKG_VERSION"));
 
         let version = HeaderValue::try_from(format!("libsql-remote-{ver}")).unwrap();
+        let namespace = namespace.map(|v| HeaderValue::try_from(v).unwrap());
 
         let inner = hyper::Client::builder().build(connector);
-
-        Self { inner, version }
+        Self {
+            inner,
+            version,
+            namespace,
+            #[cfg(any(feature = "remote", feature = "sync"))]
+            remote_encryption,
+        }
     }
 
     async fn send(
@@ -45,9 +61,21 @@ impl HttpSender {
         auth: Arc<str>,
         body: String,
     ) -> Result<super::HttpBody<ByteStream>> {
-        let req = hyper::Request::post(url.as_ref())
+        let mut req_builder = hyper::Request::post(url.as_ref())
             .header(AUTHORIZATION, auth.as_ref())
-            .header("x-libsql-client-version", self.version.clone())
+            .header("x-libsql-client-version", self.version.clone());
+
+        if let Some(namespace) = self.namespace {
+            req_builder = req_builder.header("x-namespace", namespace);
+        }
+
+        #[cfg(any(feature = "remote", feature = "sync"))]
+        if let Some(remote_encryption) = &self.remote_encryption {
+            req_builder =
+                req_builder.header("x-turso-encryption-key", remote_encryption.key.as_string());
+        }
+
+        let req = req_builder
             .body(hyper::Body::from(body))
             .map_err(|err| HranaError::Http(format!("{:?}", err)))?;
 
@@ -109,8 +137,18 @@ impl HttpConnection<HttpSender> {
         token: impl Into<String>,
         connector: ConnectorService,
         version: Option<&str>,
+        namespace: Option<&str>,
+        #[cfg(any(feature = "remote", feature = "sync"))] remote_encryption: Option<
+            crate::database::EncryptionContext,
+        >,
     ) -> Self {
-        let inner = HttpSender::new(connector, version);
+        let inner = HttpSender::new(
+            connector,
+            version,
+            namespace,
+            #[cfg(any(feature = "remote", feature = "sync"))]
+            remote_encryption,
+        );
         Self::new(url.into(), token.into(), inner)
     }
 }
@@ -131,7 +169,7 @@ impl Conn for HttpConnection<HttpSender> {
 
     async fn prepare(&self, sql: &str) -> crate::Result<Statement> {
         let stream = self.current_stream().clone();
-        let stmt = crate::hrana::Statement::new(stream, sql.to_string(), true)?;
+        let stmt = crate::hrana::Statement::new(stream, sql.to_string(), true).await?;
         Ok(Statement {
             inner: Box::new(stmt),
         })
@@ -234,6 +272,10 @@ impl crate::statement::Stmt for crate::hrana::Statement<HttpSender> {
         Some(&named_param.name)
     }
 
+    fn column_count(&self) -> usize {
+        self.cols.len()
+    }
+
     fn columns(&self) -> Vec<crate::Column> {
         //FIXME: there are several blockers here:
         // 1. We cannot know the column types before sending a query, so this method will never return results right
@@ -241,7 +283,16 @@ impl crate::statement::Stmt for crate::hrana::Statement<HttpSender> {
         // 2. Even if we do execute query, Hrana doesn't return all info that Column exposes.
         // 3. Even if we would like to return some of the column info ie. column [ValueType], this information is not
         //    present in Hrana [Col] but rather inferred from the row cell type.
-        vec![]
+        self.cols
+            .iter()
+            .map(|name| crate::Column {
+                name,
+                origin_name: None,
+                table_name: None,
+                database_name: None,
+                decl_type: None,
+            })
+            .collect()
     }
 }
 
@@ -350,7 +401,7 @@ impl Conn for HranaStream<HttpSender> {
     }
 
     async fn prepare(&self, sql: &str) -> crate::Result<Statement> {
-        let stmt = crate::hrana::Statement::new(self.clone(), sql.to_string(), true)?;
+        let stmt = crate::hrana::Statement::new(self.clone(), sql.to_string(), true).await?;
         Ok(Statement {
             inner: Box::new(stmt),
         })

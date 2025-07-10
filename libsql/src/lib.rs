@@ -132,6 +132,8 @@ pub mod params;
 cfg_sync! {
     mod sync;
     pub use database::SyncProtocol;
+    pub use database::EncryptionContext;
+    pub use database::EncryptionKey;
 }
 
 cfg_replication! {
@@ -153,6 +155,7 @@ pub use errors::Error;
 
 pub use params::params_from_iter;
 
+mod auth;
 mod connection;
 mod database;
 mod load_extension_guard;
@@ -176,7 +179,8 @@ cfg_hrana! {
 }
 
 pub use self::{
-    connection::{BatchRows, Connection},
+    auth::{AuthAction, AuthContext, Authorization},
+    connection::{AuthHook, BatchRows, Connection},
     database::{Builder, Database},
     load_extension_guard::LoadExtensionGuard,
     rows::{Column, Row, Rows},

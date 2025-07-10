@@ -20,6 +20,7 @@ async fn test_sync_context_push_frame() {
         db_path.to_str().unwrap().to_string(),
         server.url(),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -28,9 +29,9 @@ async fn test_sync_context_push_frame() {
     let mut sync_ctx = sync_ctx;
 
     // Push a frame and verify the response
-    let durable_frame = sync_ctx.push_frames(frame, 1, 0, 1).await.unwrap();
+    let durable_frame = sync_ctx.push_frames(frame, 1, 0, 1, None).await.unwrap();
     sync_ctx.write_metadata().await.unwrap();
-    assert_eq!(durable_frame, 0); // First frame should return max_frame_no = 0
+    assert_eq!(durable_frame.max_frame_no, 0); // First frame should return max_frame_no = 0
 
     // Verify internal state was updated
     assert_eq!(sync_ctx.durable_frame_num(), 0);
@@ -49,6 +50,7 @@ async fn test_sync_context_with_auth() {
         db_path.to_str().unwrap().to_string(),
         server.url(),
         Some("test_token".to_string()),
+        None,
     )
     .await
     .unwrap();
@@ -56,9 +58,9 @@ async fn test_sync_context_with_auth() {
     let frame = Bytes::from("test frame with auth");
     let mut sync_ctx = sync_ctx;
 
-    let durable_frame = sync_ctx.push_frames(frame, 1, 0, 1).await.unwrap();
+    let durable_frame = sync_ctx.push_frames(frame, 1, 0, 1, None).await.unwrap();
     sync_ctx.write_metadata().await.unwrap();
-    assert_eq!(durable_frame, 0);
+    assert_eq!(durable_frame.max_frame_no, 0);
     assert_eq!(server.frame_count(), 1);
 }
 
@@ -73,6 +75,7 @@ async fn test_sync_context_multiple_frames() {
         db_path.to_str().unwrap().to_string(),
         server.url(),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -82,9 +85,9 @@ async fn test_sync_context_multiple_frames() {
     // Push multiple frames and verify incrementing frame numbers
     for i in 0..3 {
         let frame = Bytes::from(format!("frame data {}", i));
-        let durable_frame = sync_ctx.push_frames(frame, 1, i, 1).await.unwrap();
+        let durable_frame = sync_ctx.push_frames(frame, 1, i, 1, None).await.unwrap();
         sync_ctx.write_metadata().await.unwrap();
-        assert_eq!(durable_frame, i);
+        assert_eq!(durable_frame.max_frame_no, i);
         assert_eq!(sync_ctx.durable_frame_num(), i);
         assert_eq!(server.frame_count(), i + 1);
     }
@@ -102,15 +105,16 @@ async fn test_sync_context_corrupted_metadata() {
         db_path.to_str().unwrap().to_string(),
         server.url(),
         None,
+        None,
     )
     .await
     .unwrap();
 
     let mut sync_ctx = sync_ctx;
     let frame = Bytes::from("test frame data");
-    let durable_frame = sync_ctx.push_frames(frame, 1, 0, 1).await.unwrap();
+    let durable_frame = sync_ctx.push_frames(frame, 1, 0, 1, None).await.unwrap();
     sync_ctx.write_metadata().await.unwrap();
-    assert_eq!(durable_frame, 0);
+    assert_eq!(durable_frame.max_frame_no, 0);
     assert_eq!(server.frame_count(), 1);
 
     // Update metadata path to use -info instead of .meta
@@ -123,13 +127,14 @@ async fn test_sync_context_corrupted_metadata() {
         db_path.to_str().unwrap().to_string(),
         server.url(),
         None,
+        None,
     )
     .await
     .unwrap();
 
     // Verify that the context was reset to default values
     assert_eq!(sync_ctx.durable_frame_num(), 0);
-    assert_eq!(sync_ctx.durable_generation(), 1);
+    assert_eq!(sync_ctx.durable_generation(), 0);
 }
 
 #[tokio::test]
@@ -146,15 +151,19 @@ async fn test_sync_restarts_with_lower_max_frame_no() {
         db_path.to_str().unwrap().to_string(),
         server.url(),
         None,
+        None,
     )
     .await
     .unwrap();
 
     let mut sync_ctx = sync_ctx;
     let frame = Bytes::from("test frame data");
-    let durable_frame = sync_ctx.push_frames(frame.clone(), 1, 0, 1).await.unwrap();
+    let durable_frame = sync_ctx
+        .push_frames(frame.clone(), 1, 0, 1, None)
+        .await
+        .unwrap();
     sync_ctx.write_metadata().await.unwrap();
-    assert_eq!(durable_frame, 0);
+    assert_eq!(durable_frame.max_frame_no, 0);
     assert_eq!(server.frame_count(), 1);
 
     // Bump the durable frame num so that the next time we call the
@@ -168,6 +177,7 @@ async fn test_sync_restarts_with_lower_max_frame_no() {
         db_path.to_str().unwrap().to_string(),
         server.url(),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -180,14 +190,17 @@ async fn test_sync_restarts_with_lower_max_frame_no() {
     // This push should fail because we are ahead of the server and thus should get an invalid
     // frame no error.
     sync_ctx
-        .push_frames(frame.clone(), 1, frame_no, 1)
+        .push_frames(frame.clone(), 1, frame_no, 1, None)
         .await
         .unwrap_err();
 
     let frame_no = sync_ctx.durable_frame_num() + 1;
     // This then should work because when the last one failed it updated our state of the server
     // durable_frame_num and we should then start writing from there.
-    sync_ctx.push_frames(frame, 1, frame_no, 1).await.unwrap();
+    sync_ctx
+        .push_frames(frame, 1, frame_no, 1, None)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -204,6 +217,7 @@ async fn test_sync_context_retry_on_error() {
         db_path.to_str().unwrap().to_string(),
         server.url(),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -215,7 +229,7 @@ async fn test_sync_context_retry_on_error() {
     server.return_error.store(true, Ordering::SeqCst);
 
     // First attempt should fail but retry
-    let result = sync_ctx.push_frames(frame.clone(), 1, 0, 1).await;
+    let result = sync_ctx.push_frames(frame.clone(), 1, 0, 1, None).await;
     assert!(result.is_err());
 
     // Advance time to trigger retries faster
@@ -228,9 +242,9 @@ async fn test_sync_context_retry_on_error() {
     server.return_error.store(false, Ordering::SeqCst);
 
     // Next attempt should succeed
-    let durable_frame = sync_ctx.push_frames(frame, 1, 0, 1).await.unwrap();
+    let durable_frame = sync_ctx.push_frames(frame, 1, 0, 1, None).await.unwrap();
     sync_ctx.write_metadata().await.unwrap();
-    assert_eq!(durable_frame, 0);
+    assert_eq!(durable_frame.max_frame_no, 0);
     assert_eq!(server.frame_count(), 1);
 }
 

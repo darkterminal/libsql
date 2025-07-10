@@ -212,6 +212,7 @@ impl Database {
         flags: OpenFlags,
         endpoint: String,
         auth_token: String,
+        remote_encryption: Option<crate::database::EncryptionContext>,
     ) -> Result<Database> {
         let db_path = db_path.into();
         let endpoint = if endpoint.starts_with("libsql:") {
@@ -221,8 +222,14 @@ impl Database {
         };
         let mut db = Database::open(&db_path, flags)?;
 
-        let sync_ctx =
-            SyncContext::new(connector, db_path.into(), endpoint, Some(auth_token)).await?;
+        let sync_ctx = SyncContext::new(
+            connector,
+            db_path.into(),
+            endpoint,
+            Some(auth_token),
+            remote_encryption,
+        )
+        .await?;
         db.sync_ctx = Some(Arc::new(Mutex::new(sync_ctx)));
 
         Ok(db)
@@ -266,6 +273,7 @@ impl Database {
         flags: OpenFlags,
         encryption_config: Option<EncryptionConfig>,
         http_request_callback: Option<crate::util::HttpRequestCallback>,
+        namespace: Option<String>,
     ) -> Result<Database> {
         use std::path::PathBuf;
 
@@ -284,7 +292,7 @@ impl Database {
             auth_token,
             version.as_deref(),
             http_request_callback,
-            None,
+            namespace,
         )
         .map_err(|e| crate::Error::Replication(e.into()))?;
 
@@ -465,9 +473,19 @@ impl Database {
     /// Sync WAL frames to remote.
     pub async fn sync_offline(&self) -> Result<crate::database::Replicated> {
         let mut sync_ctx = self.sync_ctx.as_ref().unwrap().lock().await;
+        // it is important we call `bootstrap` before we `sync`. Because sync uses a connection
+        // to the db and during bootstrap we replace the sqlite db file. This can lead to
+        // inconsistencies and data corruption.
+        crate::sync::bootstrap_db(&mut sync_ctx).await?;
         let conn = self.connect()?;
-
         crate::sync::sync_offline(&mut sync_ctx, &conn).await
+    }
+
+    #[cfg(feature = "sync")]
+    /// Brings the .db file from server, if required.
+    pub async fn bootstrap_db(&self) -> Result<()> {
+        let mut sync_ctx = self.sync_ctx.as_ref().unwrap().lock().await;
+        crate::sync::bootstrap_db(&mut sync_ctx).await
     }
 
     pub(crate) fn path(&self) -> &str {
